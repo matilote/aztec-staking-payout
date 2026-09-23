@@ -12,7 +12,9 @@ A small command-line tool Aztec sequencer operators run **once a week** to pay t
 **Two transaction shapes are available** (`--output-mode`):
 
 - `safe` (default for `--emit-calldata`): N top-level `ERC20.transfer` calls, one per delegator. The Safe wraps them in MultiSend at submission, so `msg.sender == Safe` on every inner transfer. Works for Safes, smart-account wallets, and cold-wallet EOAs signing one by one. **Required for Safes.**
-- `multicall` (default for live broadcast): an optional `ERC20.approve(Multicall3, total)` plus a single `Multicall3.aggregate3([ERC20.transferFrom(wallet, delegator, amount), ...])`. Fewer txs, atomic on the aggregate3 step. **Plain EOAs only** — Safes can't use this (Multicall3 becomes `msg.sender` on inner transfers and reverts with insufficient balance).
+- `disperse` (default for live broadcast): an optional `ERC20.approve(Disperse, total)` plus a single `Disperse.disperseTokenSimple(token, recipients, amounts)` against `disperse.app`'s battle-tested batch contract (mainnet `0xD152f549545093347A162Dce210e7293f1452150`; override via `config.disperseAddress` on other chains). Fewer txs. Safe under a mempool race because Disperse calls `transferFrom(msg.sender, …)` internally — only the operator's own call can spend the operator's allowance to Disperse.
+
+> **Do not batch via `Multicall3.aggregate3([token.transferFrom(operator, …)])`.** An earlier version of this tool did, and it was drained in the wild. Multicall3 lets any caller pick an arbitrary `from` for its inner calls, so an attacker seeing your `approve(Multicall3, X)` in the mempool can immediately call `Multicall3.aggregate3([token.transferFrom(you, attacker, X)])` and pull the full allowance before your own `aggregate3` lands. Never approve a router that lets the caller specify `from`.
 
 The tool **doesn't hold any funds, doesn't deploy any contracts, and doesn't send anything by default** — it produces calldata that you (or your Safe) execute.
 
@@ -71,10 +73,10 @@ The tool runs through these phases (all read-only):
 2. Reads the rollup's `getRewardConfig()` at the toBlock for the per-checkpoint sequencer reward (`checkpointReward × sequencerBps / 10000`).
 3. Resolves historical stakes to the immutable split's reward recipient. Exited validators keep rewards earned before exit. Receipt or recipient lookup failures stop the run; the staking caller is never substituted.
 4. Scans `CheckpointProposed` events in the window and recovers each checkpoint's proposer attester from its `propose()` transaction's signature. **Hard-fails** if any checkpoint can't be resolved — a plan is only ever produced from 100% resolved data.
-5. **Filters by coinbase.** Of the checkpoints proposed by the operator's attesters, only those whose `header.coinbase == distributionWalletAddress` are counted toward the reward. Mismatched coinbases are recorded in the audit trail but dropped from the count — their rewards routed elsewhere and aren't payable from the distribution wallet. This is the integrity gate against mid-window coinbase switches; `--ignore-coinbase` requires `--simulate-reward` and cannot generate a real payout.
+5. **Filters by coinbase.** Only checkpoints whose `header.coinbase == distributionWalletAddress` contribute to the payout. Mismatches remain in the audit trail. `--ignore-coinbase` requires `--simulate-reward` and cannot generate a real payout.
 6. Adds the fixed reward and net sequencer fees for every counted checkpoint, then independently reconciles their sum to `sequencerRewards(toBlock) - sequencerRewards(fromBlock) + verified claims in (fromBlock, toBlock]`. Any discrepancy stops the run before export or payment.
 7. Sums each recipient's own checkpoint earnings, then applies commission once per recipient (integer rounding down). Variable fees follow the checkpoint that earned them.
-8. Emits the planned transactions in the chosen `--output-mode` shape (`safe` or `multicall`; see the modes summary above).
+8. Emits the planned transactions in the configured output mode. Use `--output-mode safe` for Safe Transaction Builder exports.
 
 > **Before executing the calldata**, the operator needs to claim accrued sequencer rewards from the rollup so the distribution wallet holds enough to fund the transfers: `rollup.claimSequencerRewards(distributionWallet)`. Live mode pre-flights the wallet's balance and errors clearly if it's short. Safe export also checks the wallet balance before writing the bundle.
 
@@ -104,14 +106,14 @@ NEXT STEPS
   · Cold-wallet / scripted signer → read the encoded {to, value, data}
     from the audit JSON's `transactions` array and broadcast directly.
     Default shape is N separate transfers (safe mode); pass
-    --output-mode multicall to get an approve + Multicall3.aggregate3
+    --output-mode disperse to get an approve + Disperse.disperseTokenSimple
     pair instead.
 
   · EOA you control → re-run with PRIVATE_KEY set and without
     --emit-calldata to sign and broadcast in one step. Defaults to
-    --output-mode multicall (2 txs: approve + aggregate3 of N
-    transferFroms). Pass --output-mode safe to send N individual
-    transfers instead.
+    --output-mode disperse (2 txs: approve Disperse + one call to
+    Disperse.disperseTokenSimple with all N recipients). Pass
+    --output-mode safe to send N individual transfers instead.
 ```
 
 ### Step 3 — keep the audit record
@@ -200,12 +202,18 @@ Options:
                               can read them straight from there.
   --output-mode <mode>        (settle) `safe` = N top-level ERC20.transfer
                               calls (one per delegator); the Safe bundles them
-                              via MultiSend. `multicall` = optional
-                              ERC20.approve(Multicall3, total) +
-                              Multicall3.aggregate3 of N transferFrom calls;
-                              EOAs only — Safes cannot use this. Defaults:
-                              `safe` with --emit-calldata, `multicall` for
-                              live broadcast.
+                              via MultiSend. `disperse` = optional
+                              ERC20.approve(Disperse, total) +
+                              Disperse.disperseTokenSimple(token, recipients,
+                              amounts) against disperse.app's contract. Safe
+                              under a mempool race because Disperse calls
+                              transferFrom(msg.sender, …) internally — only
+                              the operator's own call can spend their
+                              allowance. Defaults: `safe` with
+                              --emit-calldata, `disperse` for live broadcast.
+                              An earlier `multicall` mode (approve Multicall3
+                              + aggregate3 of transferFrom) was removed after
+                              a live drain incident; do not reintroduce.
   --ignore-coinbase           (settle) Count every operator checkpoint in the
                               window regardless of `header.coinbase`. Default
                               counts only checkpoints whose coinbase matches
@@ -241,7 +249,7 @@ Environment:
 │   ├── proposals.ts     count checkpoints each attester proposed
 │   ├── attribution.ts   proposal-weighted (or equal) split + commission
 │   ├── epochs.ts        epoch-range → L1 block range resolver
-│   ├── calldata.ts      planned-tx builder (safe / multicall modes) + Safe export
+│   ├── calldata.ts      planned-tx builder (safe / disperse modes) + Safe export
 │   ├── settle.ts        orchestrator (the `settle` command)
 │   ├── audit.ts         per-run audit record writer + plan pretty-printer
 │   ├── client.ts        rate-limited viem PublicClient + RPC counter

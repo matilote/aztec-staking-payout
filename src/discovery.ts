@@ -167,6 +167,11 @@ export interface DiscoveryInput {
    *  it (e.g. inside a Multicall3 batch with balances/decimals), pass it here
    *  to skip an extra RPC call here. Otherwise discovery fetches it. */
   gseAddress?: Address
+  /** Status-only registration probes, unioned across these blocks.
+   * Defaults to [toBlock]. Settlement sets includeInactive and bypasses
+   * registration filtering: endpoint probes cannot prove activity throughout
+   * an epoch window or replace attribution of accepted historical proposals. */
+  activityCheckBlocks?: bigint[]
   /** Optional retry counter — incremented per scheduled retry, so the caller
    *  can report primary vs retried RPC counts. */
   retryMeter?: { retries: number }
@@ -200,6 +205,9 @@ export interface DiscoveryStats {
   stakeEventsFound: number
   uniqueAttesters: number
   registeredOnRollup: number
+  /** Status-only: candidates unregistered at all requested probe blocks.
+   * Historical settlement does not classify candidates as phantoms. */
+  phantomAttesters: Address[]
 }
 
 export interface DiscoveryResult {
@@ -235,10 +243,8 @@ export async function discoverActiveDelegators(
   } = input
   const retryMeter = input.retryMeter
 
-  // Step 1: scan stake events. Filtered by providerId only (NOT rollup) —
-  // rollup-scoping is done by the isRegistered check in step 5. Filtering
-  // by rollup here would silently return 0 if the configured rollupAddress
-  // didn't match what was emitted, hiding the real cause.
+  // Scan provider history across rollups. Settlement scopes earnings by
+  // accepted proposals and their coinbase; status checks registration below.
   const stakeEvents = await scanStakeEvents({
     client,
     stakingRegistryAddress,
@@ -262,6 +268,7 @@ export async function discoverActiveDelegators(
     stakeEventsFound: stakeEvents.length,
     uniqueAttesters: byAttester.size,
     registeredOnRollup: 0,
+    phantomAttesters: [],
   }
   if (candidates.length === 0) return { delegators: [], stats }
 
@@ -297,51 +304,58 @@ export async function discoverActiveDelegators(
     // under the bonus instance (=true) — and counts as active if EITHER is
     // true. Chunked so we can show progress and bound multicall size.
     const ATTESTERS_PER_BATCH = 25
-    for (let i = 0; i < candidates.length; i += ATTESTERS_PER_BATCH) {
-      const batch = candidates.slice(i, i + ATTESTERS_PER_BATCH)
-      const contracts = batch.flatMap((c) => [
-        {
-          address: gseAddress,
-          abi: IGSE_IS_REGISTERED_ABI,
-          functionName: "isRegistered" as const,
-          args: [rollupAddress, c.attester] as const,
-        },
-        {
-          address: gseAddress,
-          abi: IGSE_IS_REGISTERED_ABI,
-          functionName: "isRegistered" as const,
-          args: [bonusInstance, c.attester] as const,
-        },
-      ])
-      const results = await withRetry(async () => {
-        const values = await client.multicall({
-          contracts, allowFailure: true, multicallAddress, blockNumber: toBlock,
-        })
-        if (values.length !== contracts.length || values.some((r) => r.status !== "success")) {
-          throw new Error("Registration checks failed; refusing to classify unknown validators as inactive")
+    const activityCheckBlocks = input.activityCheckBlocks ?? [toBlock]
+    for (const blockNumber of activityCheckBlocks) {
+      for (let i = 0; i < candidates.length; i += ATTESTERS_PER_BATCH) {
+        const batch = candidates.slice(i, i + ATTESTERS_PER_BATCH)
+        const contracts = batch.flatMap((c) => [
+          {
+            address: gseAddress,
+            abi: IGSE_IS_REGISTERED_ABI,
+            functionName: "isRegistered" as const,
+            args: [rollupAddress, c.attester] as const,
+          },
+          {
+            address: gseAddress,
+            abi: IGSE_IS_REGISTERED_ABI,
+            functionName: "isRegistered" as const,
+            args: [bonusInstance, c.attester] as const,
+          },
+        ])
+        const results = await withRetry(async () => {
+          const values = await client.multicall({
+            contracts, allowFailure: true, multicallAddress, blockNumber,
+          })
+          if (values.length !== contracts.length || values.some((r) => r.status !== "success")) {
+            throw new Error("Registration checks failed; refusing to classify unknown validators as inactive")
+          }
+          return values
+        }, undefined, undefined, retryMeter)
+        for (let j = 0; j < batch.length; j++) {
+          const onRollup = results[2 * j]
+          const onBonus = results[2 * j + 1]
+          const isActive =
+            (onRollup?.status === "success" && onRollup.result === true) ||
+            (onBonus?.status === "success" && onBonus.result === true)
+          if (isActive) activeByAttester.set(batch[j]!.attester.toLowerCase(), true)
         }
-        return values
-      }, undefined, undefined, retryMeter)
-      for (let j = 0; j < batch.length; j++) {
-        const onRollup = results[2 * j]
-        const onBonus = results[2 * j + 1]
-        const isActive =
-          (onRollup?.status === "success" && onRollup.result === true) ||
-          (onBonus?.status === "success" && onBonus.result === true)
-        activeByAttester.set(batch[j]!.attester.toLowerCase(), isActive)
+        onProgress?.({
+          phase: "checking-attesters",
+          checked: Math.min(i + batch.length, candidates.length),
+          total: candidates.length,
+        })
       }
-      onProgress?.({
-        phase: "checking-attesters",
-        checked: Math.min(i + batch.length, candidates.length),
-        total: candidates.length,
-      })
     }
   }
 
   // Historical settlement candidates are filtered by their accepted proposals, not current registration.
   const active: DiscoveredDelegator[] = []
+  const phantomAttesters: Address[] = []
   for (const c of candidates) {
-    if (!input.includeInactive && !activeByAttester.get(c.attester.toLowerCase())) continue
+    if (!input.includeInactive && !activeByAttester.get(c.attester.toLowerCase())) {
+      phantomAttesters.push(c.attester)
+      continue
+    }
 
     const mapped = splitRecipients.get(c.splitAddress.toLowerCase())
     if (!mapped) throw new Error(`Unresolved rewards recipient for split ${c.splitAddress}; refusing to pay the staking caller`)
@@ -363,6 +377,7 @@ export async function discoverActiveDelegators(
     a.stakedAtBlock === b.stakedAtBlock ? 0 : a.stakedAtBlock < b.stakedAtBlock ? -1 : 1,
   )
   stats.registeredOnRollup = input.includeInactive ? 0 : active.length
+  stats.phantomAttesters = phantomAttesters
   return { delegators: active, stats }
 }
 
