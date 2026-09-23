@@ -69,8 +69,8 @@ export async function findDeployBlock(
  *     address stakerImplementation
  *   );
  *
- * `stakerImplementation` is the msg.sender that called `stake()` — used as
- * the fallback delegator address if the SplitCreated lookup fails.
+ * `stakerImplementation` is the msg.sender that called `stake()`, retained
+ * as provenance only; it is not a substitute for the rewards recipient.
  */
 export const STAKED_WITH_PROVIDER_EVENT = parseAbiItem(
   "event StakedWithProvider(uint256 indexed providerIdentifier, address indexed rollupAddress, address indexed attester, address coinbaseSplitContractAddress, address stakerImplementation)",
@@ -173,21 +173,21 @@ export interface DiscoveryInput {
   /** Optional progress callback. Called frequently (per log chunk, per
    *  attester-check batch). Cheap renderers only. */
   onProgress?: (p: DiscoveryProgress) => void
+  /** Settlement uses all historical stakes, including validators that exited. */
+  includeInactive?: boolean
 }
 
 export interface DiscoveredDelegator {
   attester: Address
-  /** The actual reward-recipient address. If the PullSplit's recipients[1]
-   *  was resolvable from on-chain, that wins. Otherwise we fall back to
-   *  `stakerImplementation` (the msg.sender of the stake call), with
-   *  `delegatorSource: "msg.sender"` to flag it for the audit. */
+  /** Verified recipients[1] of the immutable registry-created split. */
   delegator: Address
   /** Where the delegator address came from. */
-  delegatorSource: "split-recipient" | "msg.sender"
+  delegatorSource: "split-recipient"
   splitAddress: Address
   /** The staker (msg.sender of stake()) — kept for the audit trail. */
   staker: Address
   stakedAtBlock: bigint
+  stakedAtLogIndex?: number
 }
 
 /**
@@ -214,11 +214,10 @@ export interface DiscoveryResult {
  *      across the block range.
  *   2. For each stake, pull the `SplitCreated` log from the *same transaction*
  *      (the StakingRegistry creates the split in the stake() call) and decode
- *      `splitParams.recipients[1]`. No separate event scan or factory lookup.
- *   3. Resolve GSE via `rollup.getGSE()` and filter attesters by current
- *      `IGSE.isRegistered`.
- *   4. Return active (attester, delegator, …) records — delegator is the
- *      decoded split recipient when available; otherwise the staker.
+ *      `splitParams.recipients[1]`, verifying the factory, creator and owner.
+ *   3. Status mode checks current GSE registration; settlement retains every
+ *      historical stake and selects the applicable stake at each proposal.
+ *   4. Return verified (attester, delegator, …) records; missing data aborts.
  */
 export async function discoverActiveDelegators(
   input: DiscoveryInput,
@@ -258,10 +257,10 @@ export async function discoverActiveDelegators(
   for (const ev of stakeEvents) {
     byAttester.set(ev.attester.toLowerCase(), ev)
   }
-  const candidates = [...byAttester.values()]
+  const candidates = input.includeInactive ? stakeEvents : [...byAttester.values()]
   const stats: DiscoveryStats = {
     stakeEventsFound: stakeEvents.length,
-    uniqueAttesters: candidates.length,
+    uniqueAttesters: byAttester.size,
     registeredOnRollup: 0,
   }
   if (candidates.length === 0) return { delegators: [], stats }
@@ -272,6 +271,8 @@ export async function discoverActiveDelegators(
   const splitRecipients = await resolveSplitRecipientsFromReceipts({
     client,
     candidates,
+    stakingRegistryAddress,
+    toBlock,
     retryMeter,
     onProgress,
   })
@@ -279,69 +280,73 @@ export async function discoverActiveDelegators(
   // Step 3: resolve the GSE address (one read; can be skipped by the caller
   // pre-fetching it). The bonus-instance address is a contract-side constant
   // computed locally (`keccak256("bonus-instance")`), so no RPC needed.
-  const gseAddress =
-    input.gseAddress ??
-    ((await client.readContract({
-      address: rollupAddress,
-      abi: ISTAKING_GET_GSE_ABI,
-      functionName: "getGSE",
-      blockNumber: toBlock,
-    })) as Address)
-  const bonusInstance = BONUS_INSTANCE_ADDRESS
-
-  // Step 4: batch the isRegistered checks via Multicall3. Each attester gets
-  // two reads — under the rollup instance (moveWithLatestRollup=false) and
-  // under the bonus instance (=true) — and counts as active if EITHER is
-  // true. Chunked so we can show progress and bound multicall size.
-  const ATTESTERS_PER_BATCH = 250
   const activeByAttester = new Map<string, boolean>()
-  for (let i = 0; i < candidates.length; i += ATTESTERS_PER_BATCH) {
-    const batch = candidates.slice(i, i + ATTESTERS_PER_BATCH)
-    const contracts = batch.flatMap((c) => [
-      {
-        address: gseAddress,
-        abi: IGSE_IS_REGISTERED_ABI,
-        functionName: "isRegistered" as const,
-        args: [rollupAddress, c.attester] as const,
-      },
-      {
-        address: gseAddress,
-        abi: IGSE_IS_REGISTERED_ABI,
-        functionName: "isRegistered" as const,
-        args: [bonusInstance, c.attester] as const,
-      },
-    ])
-    const results = await client.multicall({
-      contracts,
-      allowFailure: true,
-      multicallAddress,
-      blockNumber: toBlock,
-    })
-    for (let j = 0; j < batch.length; j++) {
-      const onRollup = results[2 * j]
-      const onBonus = results[2 * j + 1]
-      const isActive =
-        (onRollup?.status === "success" && onRollup.result === true) ||
-        (onBonus?.status === "success" && onBonus.result === true)
-      activeByAttester.set(batch[j]!.attester.toLowerCase(), isActive)
+  if (!input.includeInactive) {
+    const gseAddress =
+      input.gseAddress ??
+      ((await client.readContract({
+        address: rollupAddress,
+        abi: ISTAKING_GET_GSE_ABI,
+        functionName: "getGSE",
+        blockNumber: toBlock,
+      })) as Address)
+    const bonusInstance = BONUS_INSTANCE_ADDRESS
+
+    // Step 4: batch the isRegistered checks via Multicall3. Each attester gets
+    // two reads — under the rollup instance (moveWithLatestRollup=false) and
+    // under the bonus instance (=true) — and counts as active if EITHER is
+    // true. Chunked so we can show progress and bound multicall size.
+    const ATTESTERS_PER_BATCH = 25
+    for (let i = 0; i < candidates.length; i += ATTESTERS_PER_BATCH) {
+      const batch = candidates.slice(i, i + ATTESTERS_PER_BATCH)
+      const contracts = batch.flatMap((c) => [
+        {
+          address: gseAddress,
+          abi: IGSE_IS_REGISTERED_ABI,
+          functionName: "isRegistered" as const,
+          args: [rollupAddress, c.attester] as const,
+        },
+        {
+          address: gseAddress,
+          abi: IGSE_IS_REGISTERED_ABI,
+          functionName: "isRegistered" as const,
+          args: [bonusInstance, c.attester] as const,
+        },
+      ])
+      const results = await withRetry(async () => {
+        const values = await client.multicall({
+          contracts, allowFailure: true, multicallAddress, blockNumber: toBlock,
+        })
+        if (values.length !== contracts.length || values.some((r) => r.status !== "success")) {
+          throw new Error("Registration checks failed; refusing to classify unknown validators as inactive")
+        }
+        return values
+      }, undefined, undefined, retryMeter)
+      for (let j = 0; j < batch.length; j++) {
+        const onRollup = results[2 * j]
+        const onBonus = results[2 * j + 1]
+        const isActive =
+          (onRollup?.status === "success" && onRollup.result === true) ||
+          (onBonus?.status === "success" && onBonus.result === true)
+        activeByAttester.set(batch[j]!.attester.toLowerCase(), isActive)
+      }
+      onProgress?.({
+        phase: "checking-attesters",
+        checked: Math.min(i + batch.length, candidates.length),
+        total: candidates.length,
+      })
     }
-    onProgress?.({
-      phase: "checking-attesters",
-      checked: Math.min(i + batch.length, candidates.length),
-      total: candidates.length,
-    })
   }
 
-  // Build output — filter by active + apply recipient mapping.
+  // Historical settlement candidates are filtered by their accepted proposals, not current registration.
   const active: DiscoveredDelegator[] = []
   for (const c of candidates) {
-    if (!activeByAttester.get(c.attester.toLowerCase())) continue
+    if (!input.includeInactive && !activeByAttester.get(c.attester.toLowerCase())) continue
 
     const mapped = splitRecipients.get(c.splitAddress.toLowerCase())
-    const delegator = mapped ?? c.stakerImplementation
-    const delegatorSource: DiscoveredDelegator["delegatorSource"] = mapped
-      ? "split-recipient"
-      : "msg.sender"
+    if (!mapped) throw new Error(`Unresolved rewards recipient for split ${c.splitAddress}; refusing to pay the staking caller`)
+    const delegator = mapped
+    const delegatorSource = "split-recipient" as const
 
     active.push({
       attester: c.attester,
@@ -350,13 +355,14 @@ export async function discoverActiveDelegators(
       splitAddress: c.splitAddress,
       staker: c.stakerImplementation,
       stakedAtBlock: c.stakedAtBlock,
+      stakedAtLogIndex: c.stakedAtLogIndex,
     })
   }
 
   active.sort((a, b) =>
     a.stakedAtBlock === b.stakedAtBlock ? 0 : a.stakedAtBlock < b.stakedAtBlock ? -1 : 1,
   )
-  stats.registeredOnRollup = active.length
+  stats.registeredOnRollup = input.includeInactive ? 0 : active.length
   return { delegators: active, stats }
 }
 
@@ -404,6 +410,7 @@ export async function probeProviderIds(input: {
 // -----------------------------------------------------------------------
 
 interface StakeRow {
+  stakedAtLogIndex: number
   attester: Address
   splitAddress: Address
   stakerImplementation: Address
@@ -466,6 +473,7 @@ async function scanStakeEvents(input: ScanStakeEventsInput): Promise<StakeRow[]>
         attester: getAddress(args.attester) as Address,
         splitAddress: getAddress(args.coinbaseSplitContractAddress) as Address,
         stakerImplementation: getAddress(args.stakerImplementation) as Address,
+        stakedAtLogIndex: log.logIndex ?? 0,
         stakedAtBlock: log.blockNumber ?? 0n,
         txHash: log.transactionHash as Hex,
       } satisfies StakeRow
@@ -481,6 +489,8 @@ async function scanStakeEvents(input: ScanStakeEventsInput): Promise<StakeRow[]>
 }
 
 interface ResolveSplitRecipientsInput {
+  stakingRegistryAddress: Address
+  toBlock: bigint
   client: PublicClient
   candidates: readonly StakeRow[]
   retryMeter?: { retries: number }
@@ -494,21 +504,24 @@ const RECEIPT_CONCURRENCY = 50
  * Resolve each candidate's `_userRewardsRecipient` (`recipients[1]`) by
  * reading the `SplitCreated` log from the **same transaction** that emitted
  * the stake — the StakingRegistry creates the split synchronously in
- * `stake()`, so the log is guaranteed to be in that receipt. This replaces a
- * second full-range `eth_getLogs` scan (and the `PULL_SPLIT_FACTORY()` lookup)
- * with at most one receipt fetch per stake transaction.
+ * `stake()`. The emitting factory must match `PULL_SPLIT_FACTORY()` and the
+ * split must be immutable and created by the configured registry.
  *
- * Returns a map from lowercased split address → recipients[1]. Splits whose
- * SplitCreated log we can't find are omitted; the caller falls back to
- * msg.sender for those.
+ * Returns lowercased split address → recipients[1]. The caller rejects any
+ * unresolved beneficiary; receipt failures propagate after retries.
  */
 async function resolveSplitRecipientsFromReceipts(
   input: ResolveSplitRecipientsInput,
 ): Promise<Map<string, Address>> {
-  const { client, candidates, retryMeter, onProgress } = input
+  const { client, candidates, retryMeter, onProgress, stakingRegistryAddress, toBlock } = input
   const result = new Map<string, Address>()
   if (candidates.length === 0) return result
 
+  const factory = await withRetry(() => client.readContract({
+    address: stakingRegistryAddress,
+    abi: [parseAbiItem("function PULL_SPLIT_FACTORY() view returns (address)")],
+    functionName: "PULL_SPLIT_FACTORY", blockNumber: toBlock,
+  }), undefined, undefined, retryMeter)
   const splitTopic0 = encodeEventTopics({ abi: [SPLIT_CREATED_EVENT] })[0]
 
   // Group candidates by their stake tx so each receipt is fetched once (a tx
@@ -523,22 +536,13 @@ async function resolveSplitRecipientsFromReceipts(
 
   let processed = 0
   await mapWithConcurrency(txHashes, RECEIPT_CONCURRENCY, async (txHash) => {
-    let receipt
-    try {
-      receipt = await withRetry(
-        () => client.getTransactionReceipt({ hash: txHash }),
-        undefined,
-        undefined,
-        retryMeter,
-      )
-    } catch {
-      // receipt unavailable → these candidates fall back to msg.sender
-      processed++
-      return
-    }
+    const receipt = await withRetry(
+      () => client.getTransactionReceipt({ hash: txHash }),
+      undefined, undefined, retryMeter,
+    )
     const wanted = new Map(byTx.get(txHash)!.map((c) => [c.splitAddress.toLowerCase(), true]))
     for (const log of receipt.logs) {
-      if (log.topics[0] !== splitTopic0) continue
+      if (log.topics[0] !== splitTopic0 || log.address.toLowerCase() !== factory.toLowerCase()) continue
       let decoded
       try {
         decoded = decodeEventLog({ abi: [SPLIT_CREATED_EVENT], data: log.data, topics: log.topics })
@@ -548,14 +552,22 @@ async function resolveSplitRecipientsFromReceipts(
       const args = decoded.args as {
         split: Address
         splitParams: { recipients: readonly Address[] }
+        creator: Address
+        owner: Address
       }
       const split = args.split.toLowerCase()
       if (!wanted.has(split)) continue
+      if (args.creator.toLowerCase() !== stakingRegistryAddress.toLowerCase() ||
+          args.owner !== "0x0000000000000000000000000000000000000000") {
+        throw new Error(`Split ${args.split} is not an immutable registry-created split`)
+      }
       const recipients = args.splitParams.recipients
       // StakingRegistry creates splits with recipients =
       // [providerRewardsRecipient, _userRewardsRecipient]; we want [1].
-      if (recipients.length >= 2 && recipients[1] !== undefined) {
-        result.set(split, getAddress(recipients[1]) as Address)
+      if (recipients.length === 2 && recipients[1] !== undefined && recipients[1] !== "0x0000000000000000000000000000000000000000") {
+        const recipient = getAddress(recipients[1]) as Address
+        if (result.has(split) && result.get(split) !== recipient) throw new Error(`Conflicting split ${split}`)
+        result.set(split, recipient)
       }
     }
     processed++
@@ -564,4 +576,15 @@ async function resolveSplitRecipientsFromReceipts(
     }
   })
   return result
+}
+
+/** Select the stake that existed when this accepted proposal was emitted. */
+export function delegatorAtProposal(
+  history: readonly DiscoveredDelegator[], attester: Address, block: bigint, logIndex: number,
+): DiscoveredDelegator | undefined {
+  return history.filter((d) => d.attester.toLowerCase() === attester.toLowerCase() &&
+    (d.stakedAtBlock < block || (d.stakedAtBlock === block && (d.stakedAtLogIndex ?? 0) < logIndex)))
+    .sort((a, b) => a.stakedAtBlock === b.stakedAtBlock
+      ? (a.stakedAtLogIndex ?? 0) - (b.stakedAtLogIndex ?? 0)
+      : a.stakedAtBlock < b.stakedAtBlock ? -1 : 1).at(-1)
 }
